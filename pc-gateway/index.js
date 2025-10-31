@@ -1,74 +1,115 @@
-// pc-gateway/index.js — SOLO para el beacon FSC-BP104D
-const noble = require('@abandonware/noble');
-const axios = require('axios');
+// pc-gateway/index.js
+const noble = require("@abandonware/noble");
+const axios = require("axios");
 
-const API_BASE = 'http://localhost:3000';
-const GATEWAY_ID = 'pc-windows-node';
+// 👇 si en tu Nest NO tienes app.setGlobalPrefix('api'), déjalo así
+const API_BASE = "http://localhost:3001";
+// si SÍ tienes prefix, cambia a:
+// const API_BASE = "http://localhost:3001/api";
 
-// 🔐 datos de TU beacon
-const TARGET_NAME = 'FSC-BP104D';
-const TARGET_MAC = 'DC:0D:30:23:05:EF'; // en mayúsculas
+// 👇 TU beacon
+const TARGET_MAC = "dc:0d:30:23:05:ef"; // en minúscula para comparar
+const TARGET_NAME = "FSC-BP104D";
 
-// para no spamear DB si el beacon está gritando mucho
-let lastSent = 0;
-const SEND_INTERVAL_MS = 2000; // cada 2 segundos máximo
+const SCAN_INTERVAL_MS = 5000;
+let lastSentByMac = {};
 
-noble.on('stateChange', (state) => {
-  console.log('🔵 Estado BLE:', state);
-  if (state === 'poweredOn') {
-    console.log('✅ Escaneando SOLO el beacon FSC-BP104D ...');
-    noble.startScanning([], true);
-  } else {
-    console.log('⛔ BLE no disponible');
-    noble.stopScanning();
-  }
-});
-
-noble.on('discover', async (peripheral) => {
-  const mac = (peripheral.address || peripheral.id || '').toUpperCase();
-  const advName = peripheral.advertisement?.localName || '';
-  const rssi = peripheral.rssi;
-
-  // 1️⃣ filtrar por MAC o por nombre
-  const isMyMac = mac === TARGET_MAC;
-  const isMyName = advName === TARGET_NAME;
-
-  if (!isMyMac && !isMyName) {
-    // no es tu beacon → ignorar
-    return;
-  }
-
-  // 2️⃣ mostrarlo bonito
-  console.log('✅ TU BEACON DETECTADO');
-  console.log('  🏷️ Nombre :', advName || TARGET_NAME);
-  console.log('  🆔 MAC    :', mac);
-  console.log('  📶 RSSI   :', rssi, 'dBm');
-  console.log('---------------------------------');
-
-  // 3️⃣ evitar mandar 1000 veces lo mismo
-  const now = Date.now();
-  if (now - lastSent < SEND_INTERVAL_MS) {
-    return;
-  }
-  lastSent = now;
-
-  // 4️⃣ enviar al backend
-  const payload = {
-    mac: mac,
-    name: advName || TARGET_NAME,
-    model: 'FSC-BP104D',       // lo ponemos fijo con el modelo real
-    profile: 'BLE',
-    rssi: rssi,
-    battery: null,             // esto luego lo llenamos si logramos leerlo
-    temperature: null,
-    gateway: GATEWAY_ID,
-    firmware: null,
-  };
-
+async function sendToBackend(payload) {
+  const url = `${API_BASE}/beacons/ingest`;
   try {
-    await axios.post(`${API_BASE}/beacons/ingest`, payload);
-    console.log('📤 Enviado al backend ✅');
+    await axios.post(url, payload);
+    console.log("✅ Enviado al backend:", payload.mac, payload.name);
   } catch (err) {
-    console.error('❌ Error enviando al backend:', err.message);
+    console.error(
+      "❌ Error enviando al backend:",
+      err.response?.status,
+      err.response?.data || err.message
+    );
+  }
+}
+
+function isTarget(peripheral) {
+  const mac = (peripheral.address || "").toLowerCase();
+  const name =
+    peripheral.advertisement && peripheral.advertisement.localName
+      ? peripheral.advertisement.localName
+      : "";
+
+  return mac === TARGET_MAC || name === TARGET_NAME;
+}
+
+function scanOnce() {
+  return new Promise((resolve, reject) => {
+    console.log("🔍 Buscando SOLO tu beacon...");
+
+    noble.on("discover", async (peripheral) => {
+      if (!isTarget(peripheral)) {
+        // ignoramos TODO lo demás
+        return;
+      }
+
+      const mac = peripheral.address.toUpperCase();
+      const name =
+        peripheral.advertisement && peripheral.advertisement.localName
+          ? peripheral.advertisement.localName
+          : "Desconocido";
+      const rssi = peripheral.rssi;
+
+      console.log(`📡 TU BEACON: ${name} (${mac}) RSSI=${rssi} dBm`);
+
+      // anti-spam: no mandes cada milisegundo
+      const now = Date.now();
+      if (lastSentByMac[mac] && now - lastSentByMac[mac] < 3000) {
+        return;
+      }
+      lastSentByMac[mac] = now;
+
+      const payload = {
+        mac,
+        name,
+        model: name,
+        profile: "BLE",
+        rssi,
+        battery: null,
+        gateway: "pc-windows-node",
+        firmware: null,
+      };
+
+      await sendToBackend(payload);
+    });
+
+    noble.startScanning([], true, (err) => {
+      if (err) {
+        console.error("❌ Error al iniciar escaneo:", err);
+        return reject(err);
+      }
+    });
+
+    setTimeout(() => {
+      noble.stopScanning();
+      noble.removeAllListeners("discover");
+      console.log("🛑 Fin del escaneo.\n");
+      resolve(true);
+    }, 3000);
+  });
+}
+
+async function loop() {
+  try {
+    await scanOnce();
+  } catch (e) {
+    console.error("⚠️ Error en el escaneo:", e.message);
+  } finally {
+    setTimeout(loop, SCAN_INTERVAL_MS);
+  }
+}
+
+noble.on("stateChange", (state) => {
+  if (state === "poweredOn") {
+    console.log("✅ Bluetooth listo. Empezando ciclo...");
+    loop();
+  } else {
+    console.log("⚠️ Bluetooth no está prendido:", state);
+    noble.stopScanning();
   }
 });
